@@ -604,5 +604,192 @@ async def free_agents_ranked(league_key: str, request: Request, count: int = 25,
     scored.sort(key=lambda x: x["score"], reverse=True)
     return {"week": target_week, "free_agents": scored}
 # ===================== end advanced block =====================
+# ===================== FA drop recommendations + trade finder =====================
+
+def _lineup_total(starters: list[dict]) -> float:
+    return sum(float(x.get("score", 0.0)) for x in starters)
+
+async def _score_players_map(token: str, players: list[dict], week: int | None, season_fallback: int) -> tuple[dict, dict]:
+    """Return scores map and detail map for a list of simple {player_key,pos} items."""
+    scores, detail = {}, {}
+    for p in players:
+        pk = p.get("player_key")
+        pos = (p.get("pos") or "").upper()
+        base, final, notes = await _score_player(token, pk, pos, week, season_fallback)
+        scores[pk] = final
+        detail[pk] = {"base": base, "final": final, "notes": notes}
+    return scores, detail
+
+def _players_without(players: list[dict], drop_key: str) -> list[dict]:
+    return [p for p in players if p.get("player_key") != drop_key]
+
+def _players_with(players: list[dict], add_p: dict) -> list[dict]:
+    # keep the same shape {player_key,name,pos}
+    return players + [{"player_key": add_p.get("player_key"), "name": add_p.get("name"), "pos": add_p.get("pos")}]
+
+@app.get("/league/{league_key}/free_agents_with_drops")
+async def free_agents_with_drops(
+    league_key: str,
+    request: Request,
+    team_key: str,
+    count: int = 25,
+    start: int = 0,
+    pos: Optional[str] = None,
+    max_drop_candidates: int = 8,
+):
+    """
+    Rank free agents AND, for each FA, recommend the best drop from your roster.
+    We simulate 'add FA, drop X', recompute starters, and measure lineup delta.
+    """
+    token = need_token(request)
+    slots, current_week = await _league_slots(token, league_key)
+    target_week = current_week
+    year = datetime.utcnow().year
+    season_fallback = year - 1
+
+    # Your roster + baseline
+    my_players = await _team_roster_players(token, team_key, week=None)
+    my_scores, _ = await _score_players_map(token, my_players, target_week, season_fallback)
+    starters, bench = _pick_lineup(my_players, slots, ["RB","WR","TE"], my_scores)
+    baseline_total = _lineup_total(starters)
+
+    # Get FAs (reuse your existing FA route)
+    base = await league_free_agents(league_key, request, count=count, start=start)
+    fa_list = base.get("free_agents", [])
+    if pos:
+        fa_list = [p for p in fa_list if (p.get("pos") or "").upper() == pos.upper()]
+
+    # Limit drop candidates: worst bench first, then lowest-scoring starters
+    bench_sorted = sorted(
+        [{**p, "score": my_scores.get(p.get("player_key",""), 0.0)} for p in bench],
+        key=lambda x: x["score"]
+    )
+    starters_sorted = sorted(
+        [{**p, "score": my_scores.get(p.get("player_key",""), 0.0)} for p in starters],
+        key=lambda x: x["score"]
+    )
+    drop_pool = bench_sorted[:max_drop_candidates] + starters_sorted[:max(0, max_drop_candidates - len(bench_sorted))]
+
+    recommendations = []
+    for fa in fa_list:
+        fa_key = fa.get("player_key")
+        fa_pos = (fa.get("pos") or "").upper()
+        # score FA
+        fa_base, fa_score, fa_notes = await _score_player(token, fa_key, fa_pos, target_week, season_fallback)
+
+        best = None  # (delta, drop_player, new_total, new_starters)
+        for d in drop_pool:
+            # simulate replace d -> FA
+            new_players = _players_with(_players_without(my_players, d["player_key"]), {"player_key": fa_key, "name": fa.get("name"), "pos": fa_pos})
+            # re-score: reuse old scores where possible, add FA, remove drop
+            scores = dict(my_scores)
+            scores.pop(d["player_key"], None)
+            scores[fa_key] = fa_score
+            # recompute starters for new set
+            new_starters, _bench2 = _pick_lineup(new_players, slots, ["RB","WR","TE"], scores)
+            new_total = _lineup_total(new_starters)
+            delta = new_total - baseline_total
+            if (best is None) or (delta > best[0]):
+                best = (delta, d, new_total, new_starters)
+
+        rec = {
+            "fa": {**fa, "base": fa_base, "score": fa_score, "explain": fa_notes},
+            "best_drop": None,
+            "delta": 0.0,
+            "baseline_total": baseline_total,
+            "new_total": baseline_total,
+        }
+        if best:
+            delta, drop_p, new_total, new_lineup = best
+            rec["best_drop"] = {"player_key": drop_p["player_key"], "name": drop_p["name"], "pos": drop_p["pos"], "score": drop_p["score"]}
+            rec["delta"] = delta
+            rec["new_total"] = new_total
+            rec["lineup_after"] = new_lineup
+        recommendations.append(rec)
+
+    # sort by delta desc, then FA score
+    recommendations.sort(key=lambda x: (x.get("delta",0.0), x.get("fa",{}).get("score",0.0)), reverse=True)
+    return {"week": target_week, "baseline_total": baseline_total, "recommendations": recommendations}
+
+# ------------------- Trade Finder (1-for-1) -------------------
+
+async def _team_lineup_value(token: str, league_key: str, team_key: str, week: int | None, season_fallback: int):
+    slots, _cw = await _league_slots(token, league_key)
+    players = await _team_roster_players(token, team_key, week=None)
+    scores, _detail = await _score_players_map(token, players, week, season_fallback)
+    starters, bench = _pick_lineup(players, slots, ["RB","WR","TE"], scores)
+    return _lineup_total(starters), starters, bench, players, scores, slots
+
+def _top_tradeables(bench: list[dict], scores: dict, k: int = 5) -> list[dict]:
+    arr = [{**p, "score": scores.get(p.get("player_key",""), 0.0)} for p in bench]
+    return sorted(arr, key=lambda x: x["score"], reverse=True)[:k]
+
+@app.get("/league/{league_key}/trade_finder")
+async def trade_finder(
+    league_key: str,
+    request: Request,
+    my_team_key: str,
+    per_team: int = 5,   # how many bench players from each side to consider
+    max_results: int = 20
+):
+    """
+    Suggest 1-for-1 trades that improve BOTH teams' starting lineups.
+    We simulate the swap and compute delta for each side.
+    """
+    token = need_token(request)
+    year = datetime.utcnow().year
+    season_fallback = year - 1
+    # my baseline
+    my_total, my_starters, my_bench, my_players, my_scores, my_slots = await _team_lineup_value(token, league_key, my_team_key, week=None, season_fallback=season_fallback)
+    my_tradeables = _top_tradeables(my_bench, my_scores, k=per_team)
+
+    # get league teams
+    league_teams_resp = await league_teams(league_key, request)
+    teams = league_teams_resp.get("teams", [])
+    other_teams = [t for t in teams if t.get("team_key") and t["team_key"] != my_team_key]
+
+    suggestions = []
+    for T in other_teams:
+        their_key = T["team_key"]
+        their_total, their_starters, their_bench, their_players, their_scores, their_slots = await _team_lineup_value(token, league_key, their_key, week=None, season_fallback=season_fallback)
+        their_tradeables = _top_tradeables(their_bench, their_scores, k=per_team)
+
+        for mine in my_tradeables:
+            for theirs in their_tradeables:
+                # simulate swap for me
+                my_after_players = _players_with(_players_without(my_players, mine["player_key"]), {"player_key": theirs["player_key"], "name": theirs["name"], "pos": theirs["pos"]})
+                my_scores2 = dict(my_scores)
+                my_scores2.pop(mine["player_key"], None)
+                # score incoming for me if missing
+                base_in, score_in, _notes_in = await _score_player(token, theirs["player_key"], (theirs.get("pos") or "").upper(), None, season_fallback)
+                my_scores2[theirs["player_key"]] = score_in
+                my_starters2, _ = _pick_lineup(my_after_players, my_slots, ["RB","WR","TE"], my_scores2)
+                my_total2 = _lineup_total(my_starters2)
+                my_delta = my_total2 - my_total
+
+                # simulate swap for them
+                their_after_players = _players_with(_players_without(their_players, theirs["player_key"]), {"player_key": mine["player_key"], "name": mine["name"], "pos": mine["pos"]})
+                their_scores2 = dict(their_scores)
+                their_scores2.pop(theirs["player_key"], None)
+                base_out, score_out, _notes_out = await _score_player(token, mine["player_key"], (mine.get("pos") or "").upper(), None, season_fallback)
+                their_scores2[mine["player_key"]] = score_out
+                their_starters2, _ = _pick_lineup(their_after_players, their_slots, ["RB","WR","TE"], their_scores2)
+                their_total2 = _lineup_total(their_starters2)
+                their_delta = their_total2 - their_total
+
+                if my_delta > 0 and their_delta > 0:
+                    suggestions.append({
+                        "you_give": {"player_key": mine["player_key"], "name": mine["name"], "pos": mine["pos"], "score": mine["score"]},
+                        "you_get":  {"player_key": theirs["player_key"], "name": theirs["name"], "pos": theirs["pos"], "score": theirs["score"]},
+                        "your_delta": my_delta,
+                        "their_team": T.get("name"),
+                        "their_team_key": their_key,
+                        "their_delta": their_delta,
+                        "fairness": my_delta + their_delta  # quick combined lift
+                    })
+
+    suggestions.sort(key=lambda x: x["fairness"], reverse=True)
+    return {"suggestions": suggestions[:max_results], "baseline_my_total": my_total}
+# ===================== end block =====================
 
 
