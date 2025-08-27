@@ -158,31 +158,30 @@ async def league_teams(league_key: str, request: Request):
         raise HTTPException(status_code=400, detail=f"Yahoo error {r.status_code}: {r.text[:200]}")
     data = r.json()
 
-    def find_teams_section(fc):
-        # league can be a list like [meta, {"teams": {...}}] OR a dict with "teams"
-        league = fc.get("league")
+    def get_teams_dict(fc: dict):
+        # Handle both shapes:
+        #   {"league": [ {meta...}, {"teams": {...}} ]}
+        #   {"league": {"teams": {...}}}
+        league = fc.get("fantasy_content", {}).get("league")
         if isinstance(league, list):
             for item in league:
                 if isinstance(item, dict) and "teams" in item:
                     return item["teams"]
         if isinstance(league, dict):
-            if "teams" in league:
-                return league["teams"]
-        # very defensive fallback
-        return fc.get("teams")
+            return league.get("teams")
+        return None
 
     teams_simple = []
-    try:
-        fc = data.get("fantasy_content", {})
-        teams = find_teams_section(fc)
-        count = int(teams.get("count", 0)) if isinstance(teams, dict) else 0
-        for i in range(count):
-            team_entry = teams.get(str(i), {}).get("team", [])
+    teams = get_teams_dict(data)
+    if isinstance(teams, dict):
+        for k, v in teams.items():
+            if k == "count":
+                continue
+            team_list = v.get("team", [])
             team_key = None
             name = None
             manager = None
-            # Each team is a list of dict chunks; pull out the bits we need
-            for chunk in team_entry:
+            for chunk in team_list:
                 if not isinstance(chunk, dict):
                     continue
                 if "team_key" in chunk and not team_key:
@@ -195,11 +194,8 @@ async def league_teams(league_key: str, request: Request):
                     manager = m.get("nickname") or m.get("guid")
             if team_key or name:
                 teams_simple.append({"team_key": team_key, "name": name, "manager": manager})
-    except Exception:
-        # if parsing fails, we’ll just return raw below
-        pass
 
-    return {"teams": teams_simple or [], "raw": data if not teams_simple else None}
+    return {"teams": teams_simple or [], "raw": None if teams_simple else data}
 
 
 @app.get("/team/{team_key}/roster")
