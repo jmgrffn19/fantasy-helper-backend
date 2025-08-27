@@ -158,7 +158,7 @@ async def league_teams(league_key: str, request: Request):
         raise HTTPException(status_code=400, detail=f"Yahoo error {r.status_code}: {r.text[:200]}")
     data = r.json()
 
-    # Find the { "teams": { "0": {...}, "1": {...}, "count": N } } section
+    # locate teams section
     fc = data.get("fantasy_content", {})
     league = fc.get("league")
     teams_section = None
@@ -173,24 +173,40 @@ async def league_teams(league_key: str, request: Request):
     teams_simple = []
     if isinstance(teams_section, dict):
         for k, v in teams_section.items():
-            # real team entries are numbered "0", "1", ...; skip "count"
-            if not str(k).isdigit():
+            if k == "count" or not isinstance(v, dict):
                 continue
-            team_list = v.get("team", [])
-            team_key = None
-            name = None
-            manager = None
-            for chunk in team_list:
-                if not isinstance(chunk, dict):
+            team_val = v.get("team")
+
+            # normalize to a list of dict "chunks"
+            chunks = []
+            if isinstance(team_val, list):
+                # case A: [["dict","dict",...]]
+                if team_val and isinstance(team_val[0], list):
+                    chunks = team_val[0]
+                # case B: ["dict","dict",...]
+                elif team_val and isinstance(team_val[0], dict):
+                    chunks = team_val
+
+            team_key = name = manager = None
+            for ch in chunks:
+                if not isinstance(ch, dict):
                     continue
-                if "team_key" in chunk:
-                    team_key = chunk["team_key"]
-                elif "name" in chunk:
-                    n = chunk["name"]
+                if "team_key" in ch and not team_key:
+                    team_key = ch["team_key"]
+                elif "name" in ch and not name:
+                    n = ch["name"]
                     name = n.get("full") if isinstance(n, dict) else n
-                elif "managers" in chunk:
-                    m = chunk["managers"].get("0", {}).get("manager", {})
+                elif "managers" in ch and not manager:
+                    mgrs = ch["managers"]
+                    # managers can be a dict {"0": {"manager": {...}}} OR a list [{"manager": {...}}]
+                    if isinstance(mgrs, dict):
+                        m = mgrs.get("0", {}).get("manager", {})
+                    elif isinstance(mgrs, list) and mgrs and isinstance(mgrs[0], dict):
+                        m = mgrs[0].get("manager", {})
+                    else:
+                        m = {}
                     manager = m.get("nickname") or m.get("guid")
+
             if team_key or name:
                 teams_simple.append({"team_key": team_key, "name": name, "manager": manager})
 
