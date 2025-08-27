@@ -5,12 +5,13 @@ from fastapi.middleware.cors import CORSMiddleware
 import os, secrets, base64, httpx, urllib.parse
 
 app = FastAPI(title="Fantasy Helper Backend (Starter)")
+FRONTEND_URL = os.getenv("FRONTEND_PUBLIC_URL", "https://fantasy-helper-frontend.vercel.app")
 
 # Allow all origins for simplicity in the starter (ok on free tiers)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[FRONTEND_URL],  # exact origin, not "*"
+    allow_credentials=True,        # allow cookies
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -51,7 +52,7 @@ def yahoo_login():
     url = f"{YAHOO_AUTH_URL}?{urllib.parse.urlencode(params)}"
     resp = RedirectResponse(url)
     # keep state in a cookie so a short nap doesn't break the flow
-    resp.set_cookie("oauth_state", state, max_age=600, secure=True, httponly=True, samesite="lax")
+    resp.set_cookie("oauth_state", state, max_age=600, secure=True, httponly=True, samesite="none")
     return resp
 
 @app.get("/auth/yahoo/callback")
@@ -85,9 +86,9 @@ async def yahoo_callback(request: Request):
     """
     response = HTMLResponse(html)
     if access_token:
-        response.set_cookie("y_at", access_token, max_age=3600, httponly=True, secure=True, samesite="lax")
+        response.set_cookie("y_at", access_token, max_age=3600, httponly=True, secure=True, samesite="none")
     if refresh_token:
-        response.set_cookie("y_rt", refresh_token, max_age=30*24*3600, httponly=True, secure=True, samesite="lax")
+        response.set_cookie("y_rt", refresh_token, max_age=30*24*3600, httponly=True, secure=True, samesite="none")
     return response
 
 
