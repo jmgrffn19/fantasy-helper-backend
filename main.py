@@ -792,4 +792,162 @@ async def trade_finder(
     return {"suggestions": suggestions[:max_results], "baseline_my_total": my_total}
 # ===================== end block =====================
 
+# ===================== Multi-player Trade Finder (2-for-1 / 2-for-2) =====================
+from itertools import combinations
+from typing import Iterable
+
+def _combos_up_to(items: list[dict], k_max: int) -> Iterable[tuple[dict,...]]:
+    for k in range(1, max(1, k_max) + 1):
+        for c in combinations(items, k):
+            yield c
+
+async def _simulate_side(
+    token: str,
+    players: list[dict],
+    scores: dict[str, float],
+    slots: dict,
+    give: list[dict],
+    get_: list[dict],
+    week: int | None,
+    season_fallback: int,
+    cache: dict[str, float],
+):
+    """Return (new_total, new_starters, scores2)."""
+    # remove outgoing
+    new_players = [p for p in players if p.get("player_key") not in {g["player_key"] for g in give}]
+    # add incoming (keep same shape)
+    for g in get_:
+        new_players.append({"player_key": g["player_key"], "name": g["name"], "pos": g.get("pos")})
+
+    # update scores map
+    scores2 = dict(scores)
+    for g in give:
+        scores2.pop(g["player_key"], None)
+    for g in get_:
+        pk = g["player_key"]
+        if pk in scores2:
+            continue
+        if pk in cache:
+            score_in = cache[pk]
+        else:
+            base_in, score_in, _notes_in = await _score_player(
+                token, pk, (g.get("pos") or "").upper(), week, season_fallback
+            )
+            cache[pk] = score_in
+        scores2[pk] = score_in
+
+    starters2, _bench2 = _pick_lineup(new_players, slots, ["RB","WR","TE"], scores2)
+    return _lineup_total(starters2), starters2, scores2
+
+@app.get("/league/{league_key}/trade_finder_multi")
+async def trade_finder_multi(
+    league_key: str,
+    request: Request,
+    my_team_key: str,
+    per_team: int = 6,          # how many candidates to consider from each side
+    max_from_me: int = 2,       # up to 2 players sent
+    max_from_them: int = 2,     # up to 2 players received
+    include_weak_starters: bool = False,  # also allow your weak starters as candidates
+    include_their_weak_starters: bool = False,
+    max_results: int = 40
+):
+    """
+    Suggest multi-player trades (1-for-1, 2-for-1, 1-for-2, 2-for-2).
+    Improves BOTH teams' starting lineups based on your advanced scorer.
+    """
+    token = need_token(request)
+    year = datetime.utcnow().year
+    season_fallback = year - 1
+
+    # --- my baseline
+    my_total, my_starters, my_bench, my_players, my_scores, my_slots = await _team_lineup_value(
+        token, league_key, my_team_key, week=None, season_fallback=season_fallback
+    )
+
+    # pick my candidate pool
+    my_bench_ranked = sorted(
+        [{**p, "score": my_scores.get(p.get("player_key",""), 0.0)} for p in my_bench],
+        key=lambda x: x["score"], reverse=True
+    )
+    my_pool = my_bench_ranked[:per_team]
+    if include_weak_starters:
+        weak_starters = sorted(
+            [{**p, "score": my_scores.get(p.get("player_key",""), 0.0)} for p in my_starters],
+            key=lambda x: x["score"]
+        )[:max(0, per_team // 2)]
+        my_pool = (my_pool + weak_starters)[:per_team]
+
+    # league teams
+    league_teams_resp = await league_teams(league_key, request)
+    teams = league_teams_resp.get("teams", [])
+    other_teams = [t for t in teams if t.get("team_key") and t["team_key"] != my_team_key]
+
+    suggestions = []
+    global_cache = {}  # player_key -> score to avoid recomputing
+
+    for T in other_teams:
+        their_key = T["team_key"]
+        their_total, their_starters, their_bench, their_players, their_scores, their_slots = await _team_lineup_value(
+            token, league_key, their_key, week=None, season_fallback=season_fallback
+        )
+        their_bench_ranked = sorted(
+            [{**p, "score": their_scores.get(p.get("player_key",""), 0.0)} for p in their_bench],
+            key=lambda x: x["score"], reverse=True
+        )
+        their_pool = their_bench_ranked[:per_team]
+        if include_their_weak_starters:
+            their_weak_starters = sorted(
+                [{**p, "score": their_scores.get(p.get("player_key",""), 0.0)} for p in their_starters],
+                key=lambda x: x["score"]
+            )[:max(0, per_team // 2)]
+            their_pool = (their_pool + their_weak_starters)[:per_team]
+
+        # try all combos up to the limits
+        for give_combo in _combos_up_to(my_pool, max_from_me):
+            give_keys = {g["player_key"] for g in give_combo}
+            # (avoid giving same player twice if duplicates somehow)
+            if len(give_keys) != len(give_combo):
+                continue
+
+            for get_combo in _combos_up_to(their_pool, max_from_them):
+                get_keys = {g["player_key"] for g in get_combo}
+                if len(get_keys) != len(get_combo):
+                    continue
+
+                # simulate me
+                my_total2, my_starters2, my_scores2 = await _simulate_side(
+                    token, my_players, my_scores, my_slots,
+                    list(give_combo), list(get_combo),
+                    week=None, season_fallback=season_fallback, cache=global_cache
+                )
+                my_delta = my_total2 - my_total
+                if my_delta <= 0:
+                    continue
+
+                # simulate them (reverse)
+                their_total2, their_starters2, their_scores2 = await _simulate_side(
+                    token, their_players, their_scores, their_slots,
+                    list(get_combo), list(give_combo),
+                    week=None, season_fallback=season_fallback, cache=global_cache
+                )
+                their_delta = their_total2 - their_total
+                if their_delta <= 0:
+                    continue
+
+                suggestions.append({
+                    "their_team": T.get("name"),
+                    "their_team_key": their_key,
+                    "you_give": [{"player_key": g["player_key"], "name": g["name"], "pos": g.get("pos"), "score": g.get("score")} for g in give_combo],
+                    "you_get":  [{"player_key": g["player_key"], "name": g["name"], "pos": g.get("pos"), "score": g.get("score")} for g in get_combo],
+                    "your_delta": my_delta,
+                    "their_delta": their_delta,
+                    "fairness": my_delta + their_delta,
+                    "your_total_after": my_total2,
+                    "their_total_after": their_total2,
+                })
+
+    # rank by combined lift (fairness)
+    suggestions.sort(key=lambda x: x["fairness"], reverse=True)
+    return {"baseline_my_total": my_total, "suggestions": suggestions[:max_results]}
+# ===================== end multi-player trade finder =====================
 
