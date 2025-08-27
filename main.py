@@ -158,25 +158,49 @@ async def league_teams(league_key: str, request: Request):
         raise HTTPException(status_code=400, detail=f"Yahoo error {r.status_code}: {r.text[:200]}")
     data = r.json()
 
+    def find_teams_section(fc):
+        # league can be a list like [meta, {"teams": {...}}] OR a dict with "teams"
+        league = fc.get("league")
+        if isinstance(league, list):
+            for item in league:
+                if isinstance(item, dict) and "teams" in item:
+                    return item["teams"]
+        if isinstance(league, dict):
+            if "teams" in league:
+                return league["teams"]
+        # very defensive fallback
+        return fc.get("teams")
+
     teams_simple = []
     try:
         fc = data.get("fantasy_content", {})
-        league_obj = fc.get("league", [])
-        teams = league_obj[1].get("teams", {}) if len(league_obj) > 1 else {}
-        count = int(teams.get("count", 0))
+        teams = find_teams_section(fc)
+        count = int(teams.get("count", 0)) if isinstance(teams, dict) else 0
         for i in range(count):
-            t = teams.get(str(i), {}).get("team", [])
-            meta = t[0] if t else {}
-            name = meta.get("name")
-            team_key = meta.get("team_key")
-            mgr = None
-            for entry in t:
-                if isinstance(entry, dict) and "managers" in entry:
-                    mgr = entry["managers"].get("0", {}).get("manager", {}).get("nickname")
-            teams_simple.append({"team_key": team_key, "name": name, "manager": mgr})
+            team_entry = teams.get(str(i), {}).get("team", [])
+            team_key = None
+            name = None
+            manager = None
+            # Each team is a list of dict chunks; pull out the bits we need
+            for chunk in team_entry:
+                if not isinstance(chunk, dict):
+                    continue
+                if "team_key" in chunk and not team_key:
+                    team_key = chunk["team_key"]
+                if "name" in chunk and not name:
+                    n = chunk["name"]
+                    name = n.get("full") if isinstance(n, dict) else n
+                if "managers" in chunk and not manager:
+                    m = chunk["managers"].get("0", {}).get("manager", {})
+                    manager = m.get("nickname") or m.get("guid")
+            if team_key or name:
+                teams_simple.append({"team_key": team_key, "name": name, "manager": manager})
     except Exception:
+        # if parsing fails, we’ll just return raw below
         pass
+
     return {"teams": teams_simple or [], "raw": data if not teams_simple else None}
+
 
 @app.get("/team/{team_key}/roster")
 async def team_roster(team_key: str, request: Request, week: Optional[int] = None):
