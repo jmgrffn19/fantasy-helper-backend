@@ -32,7 +32,6 @@ def health():
 @app.get("/auth/yahoo/login")
 def yahoo_login():
     state = secrets.token_urlsafe(16)
-    STATE_TOKENS[state] = True
     params = {
         "client_id": CLIENT_ID,
         "redirect_uri": REDIRECT_URI,
@@ -41,14 +40,19 @@ def yahoo_login():
         "state": state,
     }
     url = f"{YAHOO_AUTH_URL}?{urllib.parse.urlencode(params)}"
-    return RedirectResponse(url)
+    resp = RedirectResponse(url)
+    # keep state in a cookie so a short nap doesn't break the flow
+    resp.set_cookie("oauth_state", state, max_age=600, secure=True, httponly=True, samesite="lax")
+    return resp
 
 @app.get("/auth/yahoo/callback")
 async def yahoo_callback(request: Request):
     qs = dict(request.query_params)
     code = qs.get("code")
     state = qs.get("state")
-    if not code or not state or state not in STATE_TOKENS:
+    cookie_state = request.cookies.get("oauth_state")
+
+    if not code or not state or state != cookie_state:
         raise HTTPException(status_code=400, detail="Invalid OAuth state or code")
 
     basic = base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
@@ -56,30 +60,20 @@ async def yahoo_callback(request: Request):
         "Authorization": f"Basic {basic}",
         "Content-Type": "application/x-www-form-urlencoded",
     }
-    data = {
-        "grant_type": "authorization_code",
-        "redirect_uri": REDIRECT_URI,
-        "code": code,
-    }
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    data = {"grant_type": "authorization_code", "redirect_uri": REDIRECT_URI, "code": code}
+    async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.post(YAHOO_TOKEN_URL, data=data, headers=headers)
-    if resp.status_code != 200:
-        return HTMLResponse(f"<h3>Token exchange failed</h3><pre>{resp.text}</pre>", status_code=400)
-    tokens = resp.json()
+        if resp.status_code != 200:
+            return HTMLResponse(f"<h3>Token exchange failed</h3><pre>{resp.text}</pre>", status_code=400)
+        tokens = resp.json()
 
     html = f"""
-    <html>
-    <body style='font-family:sans-serif;padding:20px;'>
+    <html><body style='font-family:sans-serif;padding:20px;'>
       <h2>Yahoo Authorized 🎉</h2>
-      <p>Your backend received an access token from Yahoo.</p>
-      <p><b>Next step:</b> Go back to the frontend and click "Check Connection".</p>
-      <details>
-        <summary>Debug token (do not share)</summary>
-        <pre>{tokens}</pre>
-      </details>
+      <p>Token received. Go back to the frontend and click "Check Connection".</p>
+      <details><summary>Debug token (do not share)</summary><pre>{tokens}</pre></details>
       <p><a href="{FRONTEND_URL}">Return to Frontend</a></p>
-    </body>
-    </html>
+    </body></html>
     """
     return HTMLResponse(html)
 
