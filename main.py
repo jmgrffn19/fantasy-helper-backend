@@ -152,54 +152,49 @@ async def league_teams(league_key: str, request: Request):
     token = need_token(request)
     url = f"{Y_FANTASY}/league/{league_key}/teams?format=json"
     headers = {"Authorization": f"Bearer {token}"}
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.get(url, headers=headers)
     if r.status_code != 200:
         raise HTTPException(status_code=400, detail=f"Yahoo error {r.status_code}: {r.text[:200]}")
     data = r.json()
 
+    # Find the { "teams": { "0": {...}, "1": {...}, "count": N } } section
+    fc = data.get("fantasy_content", {})
+    league = fc.get("league")
+    teams_section = None
+    if isinstance(league, list):
+        for item in league:
+            if isinstance(item, dict) and "teams" in item:
+                teams_section = item["teams"]
+                break
+    elif isinstance(league, dict):
+        teams_section = league.get("teams")
+
     teams_simple = []
-
-    def add_from_team_list(team_list):
-        team_key, name, manager = None, None, None
-        for chunk in team_list:
-            if not isinstance(chunk, dict):
+    if isinstance(teams_section, dict):
+        for k, v in teams_section.items():
+            # real team entries are numbered "0", "1", ...; skip "count"
+            if not str(k).isdigit():
                 continue
-            if "team_key" in chunk and not team_key:
-                team_key = chunk["team_key"]
-            if "name" in chunk and not name:
-                n = chunk["name"]
-                name = n.get("full") if isinstance(n, dict) else n
-            if "managers" in chunk and not manager:
-                m = chunk["managers"].get("0", {}).get("manager", {})
-                manager = m.get("nickname") or m.get("guid")
-        if team_key or name:
-            teams_simple.append({"team_key": team_key, "name": name, "manager": manager})
+            team_list = v.get("team", [])
+            team_key = None
+            name = None
+            manager = None
+            for chunk in team_list:
+                if not isinstance(chunk, dict):
+                    continue
+                if "team_key" in chunk:
+                    team_key = chunk["team_key"]
+                elif "name" in chunk:
+                    n = chunk["name"]
+                    name = n.get("full") if isinstance(n, dict) else n
+                elif "managers" in chunk:
+                    m = chunk["managers"].get("0", {}).get("manager", {})
+                    manager = m.get("nickname") or m.get("guid")
+            if team_key or name:
+                teams_simple.append({"team_key": team_key, "name": name, "manager": manager})
 
-    # Recursively scan for any {"team": [ ... ]} blocks
-    def walk(x):
-        if isinstance(x, dict):
-            if "team" in x and isinstance(x["team"], list):
-                add_from_team_list(x["team"])
-            for v in x.values():
-                walk(v)
-        elif isinstance(x, list):
-            for v in x:
-                walk(v)
-
-    walk(data.get("fantasy_content", {}))
-
-    # De-dupe by team_key+name (just in case we found duplicates)
-    seen = set()
-    uniq = []
-    for t in teams_simple:
-        key = (t.get("team_key"), t.get("name"))
-        if key in seen:
-            continue
-        seen.add(key)
-        uniq.append(t)
-
-    return {"teams": uniq or [], "raw": None if uniq else data}
+    return {"teams": teams_simple or [], "raw": None if teams_simple else data}
 
 
 @app.get("/team/{team_key}/roster")
