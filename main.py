@@ -29,6 +29,15 @@ FRONTEND_URL = os.getenv("FRONTEND_PUBLIC_URL", "http://localhost:5500")
 def health():
     return {"ok": True}
 
+@app.get("/debug/oauth")
+def debug_oauth():
+    # SAFE to show: just the start of your client id + the redirect the server will send to Yahoo
+    return {
+        "CLIENT_ID_starts_with": (CLIENT_ID or "")[:10],
+        "REDIRECT_URI": REDIRECT_URI
+    }
+
+
 @app.get("/auth/yahoo/login")
 def yahoo_login():
     state = secrets.token_urlsafe(16)
