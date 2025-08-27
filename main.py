@@ -1,8 +1,16 @@
-
+from typing import Optional
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import RedirectResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os, secrets, base64, httpx, urllib.parse
+Y_FANTASY = "https://fantasysports.yahooapis.com/fantasy/v2"
+
+def need_token(request: Request) -> str:
+    token = request.cookies.get("y_at")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authorized (no token)")
+    return token
+
 
 app = FastAPI(title="Fantasy Helper Backend (Starter)")
 FRONTEND_URL = os.getenv("FRONTEND_PUBLIC_URL", "https://fantasy-helper-frontend.vercel.app")
@@ -138,3 +146,99 @@ async def leagues(request: Request):
         return {"leagues": leagues_simple or [], "raw": data if not leagues_simple else None}
     except Exception:
         return {"leagues": [], "raw": data}
+
+@app.get("/league/{league_key}/teams")
+async def league_teams(league_key: str, request: Request):
+    token = need_token(request)
+    url = f"{Y_FANTASY}/league/{league_key}/teams?format=json"
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(url, headers=headers)
+    if r.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Yahoo error {r.status_code}: {r.text[:200]}")
+    data = r.json()
+
+    teams_simple = []
+    try:
+        fc = data.get("fantasy_content", {})
+        league_obj = fc.get("league", [])
+        teams = league_obj[1].get("teams", {}) if len(league_obj) > 1 else {}
+        count = int(teams.get("count", 0))
+        for i in range(count):
+            t = teams.get(str(i), {}).get("team", [])
+            meta = t[0] if t else {}
+            name = meta.get("name")
+            team_key = meta.get("team_key")
+            mgr = None
+            for entry in t:
+                if isinstance(entry, dict) and "managers" in entry:
+                    mgr = entry["managers"].get("0", {}).get("manager", {}).get("nickname")
+            teams_simple.append({"team_key": team_key, "name": name, "manager": mgr})
+    except Exception:
+        pass
+    return {"teams": teams_simple or [], "raw": data if not teams_simple else None}
+
+@app.get("/team/{team_key}/roster")
+async def team_roster(team_key: str, request: Request, week: Optional[int] = None):
+    token = need_token(request)
+    week_part = f";week={week}" if week else ""
+    url = f"{Y_FANTASY}/team/{team_key}/roster{week_part}?format=json"
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(url, headers=headers)
+    if r.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Yahoo error {r.status_code}: {r.text[:200]}")
+    data = r.json()
+
+    players = []
+    try:
+        fc = data.get("fantasy_content", {})
+        team_obj = fc.get("team", [])
+        roster = team_obj[1].get("roster", {}).get("0", {}).get("players", {}) if len(team_obj) > 1 else {}
+        count = int(roster.get("count", 0))
+        for i in range(count):
+            p = roster.get(str(i), {}).get("player", [])
+            meta = p[0] if p else {}
+            player_key = meta.get("player_key")
+            name = meta.get("name", {}).get("full")
+            pos = None
+            for entry in p:
+                if isinstance(entry, dict) and "primary_position" in entry:
+                    pos = entry.get("primary_position")
+            players.append({"player_key": player_key, "name": name, "pos": pos})
+    except Exception:
+        pass
+    return {"players": players or [], "raw": data if not players else None}
+
+@app.get("/league/{league_key}/free_agents")
+async def league_free_agents(league_key: str, request: Request, count: int = 25, start: int = 0):
+    token = need_token(request)
+    url = f"{Y_FANTASY}/league/{league_key}/players;status=FA;start={start};count={count}?format=json"
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(url, headers=headers)
+    if r.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Yahoo error {r.status_code}: {r.text[:200]}")
+    data = r.json()
+
+    free_agents = []
+    try:
+        fc = data.get("fantasy_content", {})
+        league_obj = fc.get("league", [])
+        players = league_obj[1].get("players", {}) if len(league_obj) > 1 else {}
+        cnt = int(players.get("count", 0))
+        for i in range(cnt):
+            pl = players.get(str(i), {}).get("player", [])
+            meta = pl[0] if pl else {}
+            player_key = meta.get("player_key")
+            name = meta.get("name", {}).get("full")
+            pos = None
+            for entry in pl:
+                if isinstance(entry, dict) and "primary_position" in entry:
+                    pos = entry.get("primary_position")
+            free_agents.append({"player_key": player_key, "name": name, "pos": pos})
+    except Exception:
+        pass
+    return {"free_agents": free_agents or [], "raw": data if not free_agents else None}
+
+
